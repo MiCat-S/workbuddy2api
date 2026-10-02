@@ -1,8 +1,11 @@
 package scheduler
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 
@@ -222,5 +225,81 @@ func TestRunKeepaliveStillRefreshesGlobal(t *testing.T) {
 	}
 	if a.AccessToken != "new" {
 		t.Errorf("global token 未刷新: %s", a.AccessToken)
+	}
+}
+
+// TestCheckinAllGlobalRefreshPersists CheckinAll 对临期 global 账号的续期必须落盘，
+// 与 keepalive / CN 签到分支同口径：refresh token 可能被上游轮换，只改内存的话
+// 下次 keepalive 之前重启会拿磁盘上的旧 token 续期。
+func TestCheckinAllGlobalRefreshPersists(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "workbuddy-g1.json")
+	a := &auth.Auth{UID: "g1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1,
+		Domain: "www.workbuddy.ai", FilePath: path}
+	if err := a.SaveAtomic(); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New("")
+	p.Add(a)
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		ChatBaseGlobal: srv.URL, BillingBaseGlobal: srv.URL, GlobalEnabled: true}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.CheckinAll()
+
+	if f.refreshCalls.Load() != 1 {
+		t.Fatalf("global refresh calls=%d want 1", f.refreshCalls.Load())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Auth struct {
+			AccessToken string `json:"accessToken"`
+			Realm       string `json:"realm"`
+		} `json:"auth"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Auth.AccessToken != "new" {
+		t.Errorf("续期后磁盘 accessToken=%q want new（刷新结果未落盘）", doc.Auth.AccessToken)
+	}
+	if doc.Auth.Realm != "global" {
+		t.Errorf("落盘 realm=%q want global", doc.Auth.Realm)
+	}
+}
+
+// TestCheckinAllGlobalRefreshSessionDead global 账号在签到路径续期遇 12153 时，
+// 与 keepalive 同口径走连续计数：前 2 次不禁用（误判防护），第 3 次连续才禁用。
+func TestCheckinAllGlobalRefreshSessionDead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "g1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1,
+		Domain: "www.workbuddy.ai"})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		ChatBaseGlobal: srv.URL, BillingBaseGlobal: srv.URL, GlobalEnabled: true}
+	s := New(Config{Pool: p, Upstream: up})
+
+	for i := 1; i <= 2; i++ {
+		s.CheckinAll()
+		if st, _ := p.Status("g1"); st.Disabled {
+			t.Fatalf("第 %d 次 12153 不应禁用: %+v", i, st)
+		}
+	}
+	s.CheckinAll()
+	st, _ := p.Status("g1")
+	if !st.Disabled || st.DisabledReason != "12153 session dead" {
+		t.Errorf("第 3 次连续 12153 应禁用（reason=12153 session dead），实得 disabled=%v reason=%q",
+			st.Disabled, st.DisabledReason)
 	}
 }

@@ -479,7 +479,8 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			out = append(out, oc)
 			continue
 		}
-		// D4 门控：realm=global 账号无签到体系/任务中心，直接跳过（不发起任何上游调用，避免风控）。
+		// D4 门控：realm=global 账号无签到体系/任务中心，跳过签到与余额查询（避免风控）；
+		// 唯一的上游调用是 token 临期时的续期，口径与 keepalive 一致（成功即落盘）。
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
 		if a.IsGlobal() {
@@ -487,8 +488,21 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 				if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 					s.cfg.Pool.NoteRefreshFail(st.UID, err) // P0-1 续期观测台账（只记录，不判罚）
 					log.Printf("credit-refresh %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
+					var ue *upstream.Error
+					if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+						if s.cfg.Pool.NoteSessionDead(st.UID) {
+							log.Printf("WARN: credit-refresh %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+						}
+					}
 				} else {
-					s.cfg.Pool.NoteRefreshOK(st.UID) // P0-1：续期链路此刻是活的，留证
+					s.cfg.Pool.NoteRefreshOK(st.UID)    // P0-1：续期链路此刻是活的，留证
+					s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数
+					a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+					// 刷新成功必须落盘：refresh token 可能被上游轮换，只留在内存里的话，
+					// 下次 keepalive 之前重启会拿磁盘上的旧 token 续期。
+					if err := a.SaveAtomic(); err != nil {
+						log.Printf("credit-refresh %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
+					}
 				}
 			}
 			oc.Status, oc.Detail = CheckinSkipped, "global"
