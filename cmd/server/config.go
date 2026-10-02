@@ -710,6 +710,11 @@ var apiKeyGroupRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 // groups 归一：去首尾空白、丢弃空串、按首次出现顺序去重；整段为空切片 = 不限分组
 // （合法语义，不是错误）。空数组与"省略 groups 键"等价。
 func (c *Config) normalizeAPIKeys() error {
+	// 只含空白的主密钥：鉴权表按 TrimSpace 构建，会得到"未配置密钥 = 不鉴权"。
+	// 写了却写成空白多半是模板/变量替换失败，fail-open 成全开放是最坏的结果。
+	if c.APIKey != "" && strings.TrimSpace(c.APIKey) == "" {
+		return fmt.Errorf("api_key 只含空白：会被当作未配置而关闭鉴权；请填写密钥，或删除该字段（显式不鉴权）")
+	}
 	if len(c.APIKeys) == 0 {
 		return nil
 	}

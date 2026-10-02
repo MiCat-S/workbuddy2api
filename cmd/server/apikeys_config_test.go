@@ -166,3 +166,18 @@ func TestAPIKeyFPStable(t *testing.T) {
 		t.Errorf("错误信息泄露了密钥明文: %v", err)
 	}
 }
+
+// TestNormalizeAPIKeysRejectsBlankMainKey 只含空白的主密钥必须拒绝启动：鉴权表按
+// TrimSpace 构建，放过的话等于"未配置密钥 = 不鉴权"，整个网关 fail-open。
+// 未写 api_key（空串）仍是合法的显式不鉴权。
+func TestNormalizeAPIKeysRejectsBlankMainKey(t *testing.T) {
+	if err := (&Config{APIKey: "   "}).normalizeAPIKeys(); err == nil {
+		t.Error("空白 api_key 应报错")
+	}
+	if err := (&Config{APIKey: ""}).normalizeAPIKeys(); err != nil {
+		t.Errorf("空 api_key（显式不鉴权）不应报错: %v", err)
+	}
+	if err := (&Config{APIKey: " sk-main "}).normalizeAPIKeys(); err != nil {
+		t.Errorf("带首尾空白的有效 api_key 不应报错: %v", err)
+	}
+}
