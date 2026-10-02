@@ -212,14 +212,18 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
-	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
-	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
-	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// 运维观测/操作端点要求不限分组的密钥（withOps）：/status 与 /metrics 是全池视图
+	// （含其他分组账号的 uid / 昵称 / 余额），stats/reset 清的是全局统计，checkin 对
+	// 全池每个账号打上游。分组密钥是发给外部调用方的，只该用 chat 与 models。
+	// 主密钥与未配 groups 的密钥不受影响（控制台走主密钥）。
+	h.mux.HandleFunc("GET /status", h.withAuth(withOps(h.status)))
+	h.mux.HandleFunc("GET /v1/stats", h.withAuth(withOps(h.stats)))
+	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(withOps(h.statsReset)))
 	// 手动签到入口（POST /v1/checkin）。**不**挂在 admin.enabled 闸下：签到是
 	// 幂等的余额刷新（不改变账号可用性），与 /admin/accounts/* 的 disable/revive
 	// 不同量级，和 /v1/stats/reset 同类；且控制台要开箱可用，不该要求先开管理面。
-	// 仍需 api_key（withAuth）+ 30s 冷却，防脚本连点放大上游压力。
-	h.mux.HandleFunc("POST /v1/checkin", h.withAuth(h.checkin))
+	// 仍需不限分组的 api_key（withAuth+withOps）+ 30s 冷却，防脚本连点放大上游压力。
+	h.mux.HandleFunc("POST /v1/checkin", h.withAuth(withOps(h.checkin)))
 	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
 	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
 	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
@@ -257,7 +261,7 @@ func NewHandler(cfg Config) *Handler {
 	// 与 admin 同用条件注册：未开启时路径不存在，未鉴权探测无法区分它与真 404。
 	// 数据源全是进程内只读快照，scrape 不触发任何上游请求。
 	if cfg.MetricsEnabled {
-		h.mux.HandleFunc("GET /metrics", h.withAuth(h.promMetrics))
+		h.mux.HandleFunc("GET /metrics", h.withAuth(withOps(h.promMetrics)))
 	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h

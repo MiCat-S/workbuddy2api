@@ -58,7 +58,9 @@ func (h *Handler) checkin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 盖章放在成功之后：busy / 出错不该占用冷却窗口，否则一次撞车会让用户白等 30s。
-	h.lastCheckinUnix.Store(now.Unix())
+	// 用**完成**时刻而非请求开始的 now：账号多时一轮签到本身就超过 30s，按开始时刻
+	// 盖章的话冷却在返回时已过期，脚本可背靠背连续触发全量签到。
+	h.lastCheckinUnix.Store(time.Now().Unix())
 	if report.Results == nil {
 		// 保证 JSON 里是 [] 而不是 null（前端直接 .map 会炸）。
 		report.Results = []CheckinResult{}
