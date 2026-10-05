@@ -38,6 +38,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 ### 本项目不做什么
 
 - **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 ```CodeBuddy``` 并暴露 OpenAI Chat 协议；Anthropic Messages、Gemini 等其他协议的适配应由下游网关负责；
+  （本 fork 例外：内置 OpenAI Responses API 兼容层 `POST /v1/responses`，供 Codex 等只支持 Responses 协议的客户端直连，见[调用示例](#responses-api)。）
 - **不内嵌 Web 管理面板** — 网关核心保持精简，可视化面板作为独立项目维护，数据直取上游接口，不增加网关适配负担。
 
 ### 社区前端面板
@@ -305,6 +306,29 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+```
+
+<a id="responses-api"></a>
+**OpenAI Responses API（`POST /v1/responses`，本 fork 新增）** — 转接层：请求翻译成等价的 chat/completions 后走同一条选号 / 冷却 / 统计链路，输出再翻回 Responses 事件流（`response.created` → 各输出条目的 `added` / `delta` / `done` → `response.completed`）或 Response 对象。支持 `instructions`、多轮 `input`（message / function_call / function_call_output / reasoning）、`function` 与 `custom` 工具（如 Codex 的 `apply_patch`）、`reasoning.effort`、`max_output_tokens`、`text.format`、`prompt_cache_key`（同时作为会话粘性键）；思考内容以 reasoning summary 输出，回传的 reasoning 会回填为 `reasoning_content`。不支持 `previous_response_id`（网关不存响应，请每轮带全量 `input`，返回 400）；`web_search` 等内置工具上游没有对应能力，会被忽略。
+
+```bash
+curl -sN http://localhost:7863/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"global:deepseek-v4.1-flash","input":"hi","stream":true}'
+```
+
+Codex（`~/.codex/config.toml`）：
+
+```toml
+model = "global:deepseek-v4.1-flash"
+model_provider = "wb2api"
+
+[model_providers.wb2api]
+name = "WorkBuddy2API"
+base_url = "http://localhost:7863/v1"
+env_key = "WB2API_KEY"   # 环境变量里放网关 api_key
+wire_api = "responses"
 ```
 
 ## 贡献与 PR 要求
