@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
 )
@@ -70,4 +71,39 @@ func TestResponsesRequestClassIs4xx(t *testing.T) {
 		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
 	}
 	assertJSONErrorCode(t, rec.Body.String(), "invalid_request_error")
+}
+
+// TestChatAllModelCooledExplains 所有可用账号对请求模型都处于 6004 模型级冷却、本次一个上游都
+// 没打：回 429 并说明是哪个模型、最早几点恢复，而不是笼统的「所有账号暂时不可用」。
+func TestChatAllModelCooledExplains(t *testing.T) {
+	calls := 0
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return 429, `{"code":6004,"msg":"usage exceeds frequency limit, your usage will reset at 2099-01-02 03:04:05 UTC+8"}`, false
+	})
+	h := NewHandler(Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:     up,
+		SoftCooldown: time.Minute,
+	})
+	req := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+		return rec
+	}
+	req() // 首个请求撞 6004，写模型级冷却
+	rec := req()
+	if calls != 1 {
+		t.Errorf("模型冷却期间不应再打上游: calls=%d", calls)
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429 body=%s", rec.Code, rec.Body)
+	}
+	assertJSONErrorCode(t, rec.Body.String(), "rate_limit_exceeded")
+	for _, want := range []string{"glm-5.2", "rate-limited", "2099-01-02 03:04:05"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("message 缺少 %q: %s", want, rec.Body)
+		}
+	}
 }

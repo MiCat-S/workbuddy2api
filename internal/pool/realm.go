@@ -42,3 +42,37 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	return p.availableUIDsLocked(realm,
 		func(e *entry, now time.Time) bool { return e.healthyForModel(now, model) })
 }
+
+// ModelCooldownSummary 汇总「对 reqModel 处于模型级冷却（6004 限额 / 11102 无此模型）」的
+// 账号：数量与其中最早的恢复时刻（优先上游权威的 ResetAt，缺失时用 Until）。只统计
+// realm / groups 匹配、未禁用的账号。供 handler 在选不到号时给出具体原因，而不是笼统的
+// 「所有账号暂时不可用」。
+func (p *Pool) ModelCooldownSummary(reqModel, realm string, groups []string) (cooled int, earliest time.Time) {
+	if reqModel == "" {
+		return 0, time.Time{}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.a.MatchesGroups(groups) || e.disabled || e.manualDisabled {
+			continue
+		}
+		if !e.modelCooled(now, reqModel) {
+			continue
+		}
+		cooled++
+		mc := e.modelCooldowns[reqModel]
+		at := mc.ResetAt
+		if at.IsZero() || !at.After(now) {
+			at = mc.Until
+		}
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	return cooled, earliest
+}

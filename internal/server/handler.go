@@ -1271,6 +1271,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			code = "invalid_request_error"
 		}
 	}
+	if lastErr == nil {
+		// 本次一个上游都没打成就选不到号（全被跳过）：若原因是该模型在可用账号上都处于
+		// 模型级冷却（6004 限额），明说是哪个模型、最早几点恢复，并按限流语义回 429。
+		// 否则运维只看到笼统的「所有账号暂时不可用」，面板上账号又显示未冷却，无从排查。
+		if n, at := h.cfg.Pool.ModelCooldownSummary(bareModel, realm, keyGroups); n > 0 {
+			status = http.StatusTooManyRequests
+			code = "rate_limit_exceeded"
+			msg = fmt.Sprintf("model %s is rate-limited by upstream on all %d available account(s); earliest reset at %s",
+				bareModel, n, at.In(cstZone).Format("2006-01-02 15:04:05 UTC+8"))
+		}
+	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 }
