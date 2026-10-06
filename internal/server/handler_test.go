@@ -238,10 +238,10 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 	}
 }
 
-// TestChatAllBadParams503CarriesUpstreamBody 全部账号都 11101 时 503 文案必须包含
-// 上游原始 11101 信息（不再是空洞的 no_healthy_account）。
-// 现状即透传 lastErr.Error()（含上游 body），本测试把它锁定为回归。
-func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
+// TestChatAllBadParamsCarriesUpstreamBody 全部账号都 11101 时回 400（请求本身的问题，
+// 不回 503——5xx 会触发 SDK 重试与下游中转熔断），文案必须包含上游原始 11101 信息
+// （不是空洞的 no_healthy_account）。
+func TestChatAllBadParamsCarriesUpstreamBody(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF","requestId":"req-xyz-777"}`, false
 	})
@@ -249,8 +249,8 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
@@ -276,8 +276,8 @@ func TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400: request-class failure)", rec.Code, rec.Body)
 	}
 	var e struct {
 		Error struct {
@@ -1110,8 +1110,8 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400: upstream 4xx passthrough)", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("u1")
 	if st.Cooling || st.ErrTotal != 0 {

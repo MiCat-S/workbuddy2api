@@ -815,6 +815,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
+	// 失败归因计数（末端状态码用）：请求类失败（ErrBadParams / ErrClient——换号照样失败、
+	// 是请求本身的问题）与其余失败（传输层、限流、上游故障……）分开记。全部尝试都是
+	// 请求类失败时，末端回 4xx 而不是 503：5xx 会让 SDK 自动重试、让下游中转
+	// （claude-code-hub 等）把整个供应商计入故障熔断，一个畸形请求就能放大成全局事故。
+	reqClassFails, otherFails, badParamsFails := 0, 0, 0
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
@@ -975,6 +980,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游 client 已打 transport error 日志。
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
+			otherFails++
 			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
 			if !rotateBackoff(i, r.Context()) {
@@ -1080,6 +1086,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// （单号偶发 403 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
+			}
+			switch kind {
+			case upstream.ErrBadParams, upstream.ErrClient:
+				reqClassFails++
+			default:
+				otherFails++
+			}
+			// 11101 请求体解析失败：换一个号再试一次是为了排除「该号模型权限不同」，
+			// 第二个号也同样失败就确定是请求本身的问题，不再继续放大到全部账号。
+			if kind == upstream.ErrBadParams {
+				if badParamsFails++; badParamsFails >= 2 {
+					break
+				}
 			}
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避，WAF P0-2）
@@ -1241,6 +1260,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
 			msg = s
+		}
+		// 每次尝试都是请求类失败（没有任何传输 / 限流 / 上游故障）：问题在请求本身，回上游的
+		// 4xx（缺失时 400）。不回 503——见 reqClassFails 处的说明。
+		if reqClassFails > 0 && otherFails == 0 && (ue.Kind == upstream.ErrBadParams || ue.Kind == upstream.ErrClient) {
+			status = http.StatusBadRequest
+			if ue.Status >= 400 && ue.Status < 500 && ue.Status != http.StatusTooManyRequests {
+				status = ue.Status
+			}
+			code = "invalid_request_error"
 		}
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
