@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
 
 // responsesWriter 夹在 chatCompletions 与真实 ResponseWriter 之间，按 chat 链路的输出形态分三路：
-//   - 非 200（错误信封）：原样透传——Responses 客户端认的错误也是 {"error":{...}} 信封；
+//   - 非 200（错误信封）：缓存后透传——Responses 客户端认的错误也是 {"error":{...}} 信封，
+//     只把错误码改成 Responses 客户端认得的口径（见 responsesErrorCode）；
 //   - 200 + text/event-stream：逐帧把 chat.completion.chunk 翻成 Responses 事件流；
 //   - 200 + JSON（非流式聚合结果）：缓存，finish 时整体翻成 Response 对象。
 //
@@ -20,6 +22,7 @@ type responsesWriter struct {
 	fl   http.Flusher
 	meta *responsesMeta
 	mode rwMode
+	code int // 透传模式下 chat 链路写的状态码
 
 	line bytes.Buffer // SSE 未成行的残片
 	body bytes.Buffer // 非流式 JSON
@@ -56,6 +59,8 @@ type respItem struct {
 	text   strings.Builder // 思考文本 / 正文 / 工具参数
 	callID string
 	name   string
+	// genCallID 上游首片没给 id、由网关生成：后续分片若补上真 id 则替换。
+	genCallID bool
 }
 
 func newResponsesWriter(w http.ResponseWriter, meta *responsesMeta) *responsesWriter {
@@ -81,7 +86,7 @@ func (s *responsesWriter) decide(code int) {
 	switch {
 	case code != http.StatusOK:
 		s.mode = rwPassthrough
-		s.w.WriteHeader(code)
+		s.code = code
 	case strings.Contains(s.w.Header().Get("Content-Type"), "text/event-stream"):
 		s.mode = rwSSE
 	default:
@@ -94,9 +99,7 @@ func (s *responsesWriter) Write(p []byte) (int, error) {
 		s.decide(http.StatusOK)
 	}
 	switch s.mode {
-	case rwPassthrough:
-		return s.w.Write(p)
-	case rwJSON:
+	case rwPassthrough, rwJSON:
 		return s.body.Write(p)
 	}
 	if s.writeErr != nil {
@@ -117,12 +120,8 @@ func (s *responsesWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Flush 只在透传模式下转发；SSE 模式每个事件写出后已即时 flush。
-func (s *responsesWriter) Flush() {
-	if s.mode == rwPassthrough && s.fl != nil {
-		s.fl.Flush()
-	}
-}
+// Flush 空操作：SSE 模式每个事件写出后已即时 flush；透传与 JSON 模式在 finish 时一次写出。
+func (s *responsesWriter) Flush() {}
 
 func (s *responsesWriter) handleLine(ln string) {
 	switch {
@@ -243,14 +242,24 @@ func (s *responsesWriter) toolDelta(tm map[string]any) {
 	name, _ := fn["name"].(string)
 	args, _ := fn["arguments"].(string)
 	it := s.tools[idx]
+	if it != nil {
+		// 上游偶有首片不带 name / id、后续分片才补的形态：补上，收尾时的 done 条目以此为准。
+		if it.name == "" && name != "" {
+			it.name = name
+		}
+		if id, _ := tm["id"].(string); id != "" && it.genCallID {
+			it.callID, it.genCallID = id, false
+		}
+	}
 	if it == nil {
 		s.closeOpen() // 模型转入工具调用：先收尾正在输出的思考/正文
 		callID, _ := tm["id"].(string)
-		if callID == "" {
+		gen := callID == ""
+		if gen {
 			callID = newRespID("call_")
 		}
 		it = s.newItem("tool", newRespID(toolItemPrefix(s.meta, name)))
-		it.callID, it.name = callID, name
+		it.callID, it.name, it.genCallID = callID, name, gen
 		s.tools[idx] = it
 		s.emit("response.output_item.added", map[string]any{
 			"output_index": it.index,
@@ -321,9 +330,22 @@ func (s *responsesWriter) complete() {
 	}
 	s.finished = true
 	s.start()
+	// 没有 finish_reason 就结束：StreamHint 在上游 EOF 时会自动补 [DONE]，所以 [DONE]
+	// 不代表正常收尾。实测上游正常结束必带 finish_reason，缺了就是被截断。
+	if s.failure == nil && s.finishReason == "" {
+		s.failure = map[string]any{"code": "stream_interrupted", "message": "upstream stream ended without a finish_reason"}
+	}
+	truncated := s.failure != nil || s.finishReason == "length"
 	s.closeOpen()
 	for _, k := range sortedKeys(s.tools) {
-		s.closeItem(s.tools[k])
+		it := s.tools[k]
+		// 与非流式 Aggregate 的 dropTruncatedToolCalls 同口径：截断时参数不是合法 JSON 的
+		// 工具调用不发 done、不进 output——客户端（Codex）会按 done 条目执行工具，半截参数只会出错。
+		if args := it.text.String(); truncated && args != "" && !json.Valid([]byte(args)) {
+			log.Printf("[responses] dropped truncated tool call name=%s (invalid arguments)", it.name)
+			continue
+		}
+		s.closeItem(it)
 	}
 	output := make([]any, 0, s.nextIndex)
 	for i := 0; i < s.nextIndex; i++ {
@@ -355,6 +377,9 @@ func (s *responsesWriter) complete() {
 // finish 在 chatCompletions 返回后调用：非流式翻译并写出；流式补齐未收尾的事件流。
 func (s *responsesWriter) finish() {
 	switch s.mode {
+	case rwPassthrough:
+		s.w.WriteHeader(s.code)
+		_, _ = s.w.Write(rewriteErrorEnvelope(s.body.Bytes()))
 	case rwPending:
 		// chat 链路什么都没写（正常路径不会发生）：按 502 兜底，免得客户端空等。
 		writeOpenAIError(s.w, http.StatusBadGateway, "upstream_parse", "empty response from chat pipeline")
@@ -366,14 +391,8 @@ func (s *responsesWriter) finish() {
 		}
 		writeJSON(s.w, http.StatusOK, chatCompletionToResponse(s.meta, cc))
 	case rwSSE:
-		if s.finished {
-			return
-		}
-		// 没等到 [DONE] 流就结束了（上游读错误 / 客户端断开）：已拿到 finish_reason
-		// 按正常收尾，否则判失败——Responses 客户端要求事件流必须以终态事件结束。
-		if s.finishReason == "" && s.failure == nil {
-			s.failure = map[string]any{"code": "stream_interrupted", "message": "upstream stream ended before completion"}
-		}
+		// 没等到 [DONE] 流就结束了（上游读错误 / 客户端断开）：补终态事件——Responses
+		// 客户端要求事件流必须以终态事件结束。complete 幂等，已收尾时是空操作。
 		s.complete()
 	}
 }
@@ -411,9 +430,39 @@ func responsesError(e map[string]any) map[string]any {
 	if code == "" {
 		code = "upstream_error"
 	}
+	code = responsesErrorCode(code)
 	msg, _ := e["message"].(string)
 	if hint, _ := e["gateway_hint"].(string); hint != "" {
 		msg += " (" + hint + ")"
 	}
 	return map[string]any{"code": code, "message": msg}
+}
+
+// responsesErrorCode 把网关自有错误码换成 Responses 客户端认得的口径。上下文超长网关报
+// prompt_too_long，OpenAI（及 Codex 据此触发上下文压缩）用的是 context_length_exceeded。
+func responsesErrorCode(code string) string {
+	if code == "prompt_too_long" {
+		return "context_length_exceeded"
+	}
+	return code
+}
+
+// rewriteErrorEnvelope 改写 {"error":{"code":...}} 信封里的错误码；解析失败原样返回。
+func rewriteErrorEnvelope(raw []byte) []byte {
+	var env map[string]any
+	if json.Unmarshal(raw, &env) != nil {
+		return raw
+	}
+	e, ok := env["error"].(map[string]any)
+	if !ok {
+		return raw
+	}
+	code, _ := e["code"].(string)
+	if mapped := responsesErrorCode(code); mapped != code {
+		e["code"] = mapped
+		if out, err := json.Marshal(env); err == nil {
+			return out
+		}
+	}
+	return raw
 }

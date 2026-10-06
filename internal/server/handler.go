@@ -213,6 +213,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// OpenAI Responses API 兼容层（responses.go）：翻译后复用 chatCompletions 整条链路。
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	h.mux.HandleFunc("/v1/responses", h.withAuth(responsesNotSupported))
+	h.mux.HandleFunc("/v1/responses/", h.withAuth(responsesNotSupported))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	// 运维观测/操作端点要求不限分组的密钥（withOps）：/status 与 /metrics 是全池视图
 	// （含其他分组账号的 uid / 昵称 / 余额），stats/reset 清的是全局统计，checkin 对

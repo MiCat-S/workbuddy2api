@@ -222,7 +222,10 @@ func (b *chatMsgBuilder) attachReasoning(m map[string]any) {
 	if b.pendingReasoning == "" {
 		return
 	}
-	if s, _ := m["reasoning_content"].(string); s == "" {
+	// 同一轮里先后有两段思考（思考 → 工具 → 思考 → 工具）时串接，不覆盖也不丢。
+	if s, _ := m["reasoning_content"].(string); s != "" {
+		m["reasoning_content"] = s + "\n\n" + b.pendingReasoning
+	} else {
 		m["reasoning_content"] = b.pendingReasoning
 	}
 	b.pendingReasoning = ""
@@ -271,6 +274,9 @@ func (b *chatMsgBuilder) addItem(it map[string]any) error {
 		if err != nil {
 			return err
 		}
+		// 思考只属于紧随其后的助手输出；中间插进非助手消息（如被打断的回合），丢弃，
+		// 免得挂到后面不相干的 assistant 上。
+		b.pendingReasoning = ""
 		b.msgs = append(b.msgs, map[string]any{"role": role, "content": content})
 	case "function_call", "custom_tool_call":
 		callID, _ := it["call_id"].(string)
@@ -293,6 +299,7 @@ func (b *chatMsgBuilder) addItem(it map[string]any) error {
 			"function": map[string]any{"name": name, "arguments": args},
 		})
 	case "function_call_output", "custom_tool_call_output":
+		b.pendingReasoning = ""
 		callID, _ := it["call_id"].(string)
 		b.msgs = append(b.msgs, map[string]any{
 			"role":         "tool",
@@ -760,4 +767,17 @@ func sortedKeys(m map[int]*respItem) []int {
 	}
 	sort.Ints(keys)
 	return keys
+}
+
+// responsesNotSupported 兜住 /v1/responses 的其余形态：非 POST 方法与子路径
+// （/{id}、/{id}/cancel、/compact、/input_tokens …）。网关不存响应，这些都无从实现；
+// 回 JSON 错误信封而不是 mux 默认的纯文本，客户端才能解析出原因。
+func responsesNotSupported(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/responses" {
+		w.Header().Set("Allow", http.MethodPost)
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST /v1/responses")
+		return
+	}
+	writeOpenAIError(w, http.StatusNotFound, "not_found",
+		"not supported: this gateway does not store responses, so retrieve/cancel/compact/input_tokens endpoints are unavailable")
 }
