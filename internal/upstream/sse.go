@@ -3,6 +3,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,51 @@ var errStreamInterrupted = errors.New("upstream stream interrupted")
 
 // IsStreamInterrupted 报告错误是否为「流中途读失败」（区别于空流与客户端写失败）。
 func IsStreamInterrupted(err error) bool { return errors.Is(err, errStreamInterrupted) }
+
+// StreamErrorFrame 上游在 HTTP 200 的 SSE 流里下发了 error 帧（{"error":{...}}）。
+// Payload 是该帧原文，调用方用 FrameKind 分类后走与 HTTP 错误相同的处置。
+type StreamErrorFrame struct{ Payload string }
+
+func (e *StreamErrorFrame) Error() string { return "upstream error frame: " + e.Payload }
+
+// IsErrorFrame 报告 SSE data payload 是否为 error 帧（JSON 对象且 error 键非空）。
+func IsErrorFrame(payload string) bool {
+	if !strings.Contains(payload, `"error"`) {
+		return false // 快速路径：正常 chunk 不做 JSON 解析
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(payload), &obj) != nil {
+		return false
+	}
+	e, ok := obj["error"]
+	return ok && string(e) != "null"
+}
+
+// PeekFirstFrame 读到首个 data 帧为止（注释 / 空行一并读走），返回首帧 payload 与一个
+// 能原样重放已读字节、再接着读后续内容的 reader——调用方据此在向客户端写任何字节、
+// 判定成功之前，先看上游是不是「200 开流、首帧即 error」。读不到 data 帧（EOF / 读错）
+// 时 payload 为空，返回的 reader 会原样重现同样的结尾（EOF 或该读错误）。
+func PeekFirstFrame(r io.Reader) (io.Reader, string) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	var consumed bytes.Buffer
+	for {
+		line, err := br.ReadString('\n')
+		consumed.WriteString(line)
+		if t := strings.TrimRight(line, "\r\n"); strings.HasPrefix(t, "data: ") {
+			return io.MultiReader(&consumed, br), strings.TrimPrefix(t, "data: ")
+		}
+		if err != nil {
+			if err == io.EOF {
+				return &consumed, ""
+			}
+			return io.MultiReader(&consumed, errorOnlyReader{err}), ""
+		}
+	}
+}
+
+type errorOnlyReader struct{ err error }
+
+func (r errorOnlyReader) Read([]byte) (int, error) { return 0, r.err }
 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
@@ -161,6 +207,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					// error 帧（上游 200 开流后在流里报错，如 6004 限流）：此前被当成普通帧
+					// 忽略，客户端拿到「200 + 空 content + stop」的假成功。交回调用方分类处理。
+					if e, ok := chunk["error"]; ok && e != nil {
+						return nil, &StreamErrorFrame{Payload: payload}
+					}
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {

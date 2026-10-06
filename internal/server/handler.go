@@ -982,6 +982,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
+		// 首帧 error（上游 HTTP 200 开流、第一帧却是 error，如 6004 模型限流）：此时还没向
+		// 客户端写任何字节，按 HTTP 错误同等处置——分类、冷却、换号。否则会被当成成功：
+		// NoteSuccess、粘性绑定到这个号、不写模型冷却，同会话后续请求反复打同一个已限流的号。
+		if status < 400 && terr == nil && rc != nil {
+			replay, first := upstream.PeekFirstFrame(rc)
+			if upstream.IsErrorFrame(first) {
+				rc.Close()
+				kind := frameErrKind(first)
+				status = statusForErrKind(kind)
+				respBody = []byte(first)
+				uerr = &upstream.Error{Kind: kind, Status: status, Msg: first}
+				log.Printf("WARN: [server] acct=%s model=%s: upstream 200 but first frame is error (%s): %s",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(first, 300))
+			} else {
+				rc = replayReadCloser{Reader: replay, Closer: rc}
+			}
+		}
 		if status >= 400 {
 			st.status = status
 			var kind upstream.ErrKind
@@ -1114,6 +1131,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					log.Printf("WARN: [server] stream acct=%s model=%s: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 				}
 			}
+			if ef := stats.ErrorFrame(); ef != "" {
+				// 流中途 error 帧（首帧正常、开流后上游才报错）：头已发出、无法换号，但账号侧
+				// 照常处置——按帧分类施加冷却，并解除刚建立的粘性绑定，免得同会话下一轮
+				// 又落到这个号上。客户端已从流里收到该 error 帧（StreamHint 原样透传）。
+				h.noteMidStreamErrorFrame(acct, bareModel, stickyKey, ef)
+				st.status = statusForErrKind(frameErrKind(ef))
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1145,6 +1169,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
+		var ef *upstream.StreamErrorFrame
+		if errors.As(err, &ef) {
+			// 非流式还没写任何字节：把上游 error 帧按分类映射成错误响应（不再是 200 + 空 content
+			// 的假成功），账号侧与流式同口径处置。
+			kind := frameErrKind(ef.Payload)
+			h.noteMidStreamErrorFrame(acct, bareModel, stickyKey, ef.Payload)
+			st.status = statusForErrKind(kind)
+			code := "upstream_error"
+			if kind == upstream.ErrSoftRate {
+				code = "rate_limit_exceeded"
+			}
+			writeOpenAIErrorHint(w, st.status, code, frameErrorMessage(ef.Payload),
+				h.hintOf(kind, ef.Payload, bareModel, reqHasImage, nil))
+			return
+		}
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
@@ -1381,6 +1420,65 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// replayReadCloser 偷看首帧后的上游 body：读走重放后的流，Close 仍关原连接。
+type replayReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// frameErrKind 给 SSE error 帧分类；判不出的按上游故障处理（帧本身就说明这次失败了）。
+func frameErrKind(payload string) upstream.ErrKind {
+	if k := upstream.FrameKind(payload); k != upstream.ErrNone {
+		return k
+	}
+	return upstream.ErrServer
+}
+
+// statusForErrKind error 帧没有 HTTP 状态码可用，按分类给一个语义对应的状态（日志、
+// 统计与非流式错误响应用）。
+func statusForErrKind(k upstream.ErrKind) int {
+	switch k {
+	case upstream.ErrSoftRate:
+		return http.StatusTooManyRequests
+	case upstream.ErrHardCredit:
+		return http.StatusPaymentRequired
+	case upstream.ErrSessionDead:
+		return http.StatusUnauthorized
+	case upstream.ErrNotFound:
+		return http.StatusNotFound
+	case upstream.ErrAccountFault, upstream.ErrWafBlock:
+		return http.StatusForbidden
+	case upstream.ErrServer:
+		return http.StatusBadGateway
+	}
+	return http.StatusBadRequest
+}
+
+// frameErrorMessage 取 error 帧里的 message（缺失时退回帧原文）。
+func frameErrorMessage(payload string) string {
+	var f struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(payload), &f) == nil && strings.TrimSpace(f.Error.Message) != "" {
+		return f.Error.Message
+	}
+	return payload
+}
+
+// noteMidStreamErrorFrame 成功开流后才出现的 error 帧：按分类对账号施加冷却，并解除本次
+// 刚建立的粘性绑定。applyErrorPolicy 对内容拦截 / 上下文超长等请求级错误本就不罚号。
+func (h *Handler) noteMidStreamErrorFrame(acct *auth.Auth, bareModel, stickyKey, payload string) {
+	kind := frameErrKind(payload)
+	log.Printf("WARN: [server] acct=%s model=%s: error frame after stream start (%s): %s",
+		logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(payload, 300))
+	h.applyErrorPolicy(acct.UID, kind, payload, bareModel, nil)
+	if stickyKey != "" && h.cfg.Session != nil {
+		h.cfg.Session.Unbind(stickyKey)
+	}
+}
 
 // statusClientClosedRequest 客户端在响应完成前断开（nginx 的 499 口径）。只用于日志与
 // 统计，不会真的写给客户端（连接已经没了）。

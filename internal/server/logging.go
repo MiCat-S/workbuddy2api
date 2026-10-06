@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -94,12 +95,16 @@ type chatStatsReader struct {
 	cacheMiss int     // 末帧 usage.prompt_cache_miss_tokens
 	cacheWr   int     // 末帧 usage.prompt_cache_write_tokens
 	pend      []byte  // 已读未返回的行缓存
+	errFrame  string  // 流中首个 error 帧原文（上游 200 开流后报错，见 ErrorFrame）
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
 	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
 }
+
+// ErrorFrame 返回流中首个 error 帧原文；没有则为空串。
+func (s *chatStatsReader) ErrorFrame() string { return s.errFrame }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。
 func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
@@ -136,6 +141,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if !s.seen {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
+	}
+	if s.errFrame == "" && upstream.IsErrorFrame(payload) {
+		s.errFrame = payload
 	}
 	var chunk struct {
 		Usage *struct {
