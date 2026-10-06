@@ -217,7 +217,8 @@ func TestLogChatRowFormat(t *testing.T) {
 // 运维会误以为是另一个模型（真实踩坑点）。26 列宽覆盖 realm 前缀 + 最长模型名。
 func TestLogChatRowModelNotTruncated(t *testing.T) {
 	withChatLog(t)
-	for _, model := range []string{"cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash"} {
+	// -sg 变体超过列宽：截断会把收费的 -sg 显示成免费的原模型（真实踩坑点）。
+	for _, model := range []string{"cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash", "global:deepseek-v4.1-flash-sg"} {
 		out := captureStdout(t, func() {
 			logChatRow(0, time.Second, model, "stream", "00e26541abcdef", "sample", http.StatusOK, 1)
 		})
