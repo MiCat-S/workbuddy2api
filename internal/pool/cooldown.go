@@ -57,10 +57,9 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
-		// 非模型级冷却入口：清空 6004 模型级独立冷却表（modelCooldowns），
-		// 避免上一次模型级限流的模型豁免泄漏到本次**账号级**限流上
-		// （否则换模型请求会错误绕过本次冷却）。
-		e.modelCooldowns = nil
+		// 保留 6004 / 11102 模型级独立冷却（modelCooldowns）：账号级冷却期间
+		// 选号先判账号级（healthyForModel → healthy），换模型请求不会绕过本次冷却；
+		// 清掉的话，账号级冷却一结束该号又会被选去跑已知限额的模型、再吃一次 6004。
 		p.dirty.Store(true)
 	}
 }
@@ -103,7 +102,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			}
 			e.coolKind = CoolSoft
 			e.reason = reason
-			e.modelCooldowns = nil
+			// 保留 6004 / 11102 模型级独立冷却（modelCooldowns）：账号级冷却期间
+			// 选号先判账号级（healthyForModel → healthy），换模型请求不会绕过本次冷却；
+			// 清掉的话，账号级冷却一结束该号又会被选去跑已知限额的模型、再吃一次 6004。
 		}
 		p.dirty.Store(true)
 	}
@@ -210,7 +211,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		}
 		e.coolKind = CoolSoft
 		e.reason = reason
-		e.modelCooldowns = nil // 账号级软冷却：清空模型豁免（切模型不绕过）
+		// 账号级软冷却：保留模型级冷却（见 Cooldown 同名注释），切模型不会绕过——选号先判账号级。
 		p.dirty.Store(true)
 	}
 }

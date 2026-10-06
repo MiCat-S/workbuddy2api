@@ -285,10 +285,10 @@ func (e *entry) healthy(now time.Time) bool {
 // 上下文，用「存在豁免形态」表达"该账号还有别的模型可服务"；
 // chat 侧按请求模型细粒度判定（healthyForModel：全账号健康且该模型不在独立
 // 冷却内才放行），探活存在性语义与选号在豁免账号上口径一致。
-// 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
-func (e *entry) modelExempt() bool {
-	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && !e.manualDisabled && e.breakerUntil.IsZero()
+// 账号级冷却（until / degradeUntil / 熔断）期间不算豁免：账号级冷却不再清空
+// modelCooldowns（cooldown.go），只看形态的话会把整号冷却中的账号误报为可服务。
+func (e *entry) modelExempt(now time.Time) bool {
+	return len(e.modelCooldowns) > 0 && e.healthy(now)
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。

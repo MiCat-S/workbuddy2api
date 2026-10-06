@@ -557,7 +557,7 @@ func (p *Pool) servableLocked(realm string) bool {
 		if p.inFlightFull(e) {
 			continue
 		}
-		if e.healthy(now) || e.modelExempt() {
+		if e.healthy(now) || e.modelExempt(now) {
 			return true
 		}
 	}

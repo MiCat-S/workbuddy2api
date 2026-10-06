@@ -1092,8 +1092,9 @@ func TestServableNowExemptButDisabled(t *testing.T) {
 }
 
 // TestModelCooldownsClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
-// **非模型级**软冷却（plain Cooldown），modelCooldowns 必须被清空——否则上次 6004 的
-// 模型豁免会泄漏到本次账号级限流上，导致"换模型请求"错误绕过本次冷却。
+// **非模型级**软冷却（plain Cooldown），"换模型请求"不得绕过本次账号级冷却。
+// （账号级冷却现在保留 modelCooldowns，靠选号先判账号级保证不绕过，见
+// TestModelCooldownSurvivesAccountCooldown。）
 func TestModelCooldownsClearedByPlainCooldown(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
@@ -1114,7 +1115,7 @@ func TestModelCooldownsClearedByPlainCooldown(t *testing.T) {
 	// 3) 换模型请求不得再豁免（modelCooldowns 已清空）。
 	got := p.PickExcludingForRealm(nil, "hy3-x", "")
 	if got == nil || got.UID != "u2" {
-		t.Fatalf("plain cooldown must clear modelCooldowns (no bypass), got %+v", got)
+		t.Fatalf("plain cooldown must not be bypassed by a different-model request, got %+v", got)
 	}
 }
 
@@ -2000,4 +2001,39 @@ func TestStatusExposesRuntimeFields(t *testing.T) {
 		t.Errorf("breaker_fails=%d want 1", st.BreakerFails)
 	}
 	p.Release("u1")
+}
+
+// TestModelCooldownSurvivesAccountCooldown 账号级冷却不再清空 6004 模型级冷却：账号级冷却
+// 结束后，该号对已知限额的模型仍被避开（不再白打一次上游吃 6004），对其他模型照常可用；
+// 账号级冷却期间 ServableNow 不得因模型级冷却记录把它误报成可服务。
+func TestModelCooldownSurvivesAccountCooldown(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetSoftRateMax(24 * time.Hour)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "flash", "6004")
+	p.Cooldown("u1", CoolSoft, 50*time.Millisecond, "429 rate limit")
+
+	if p.ServableNow() {
+		t.Fatal("账号级冷却中、唯一号不应被报为可服务（模型级冷却记录不是豁免）")
+	}
+	p.mu.RLock()
+	n := len(p.byUID["u1"].modelCooldowns)
+	p.mu.RUnlock()
+	if n != 1 {
+		t.Fatalf("账号级冷却后模型级冷却应保留，实得 %d 条", n)
+	}
+
+	time.Sleep(80 * time.Millisecond) // 账号级冷却到期
+	if got := p.PickExcludingForRealm(nil, "flash", ""); got != nil {
+		t.Fatalf("账号级冷却结束后 flash 仍在模型级冷却，不应选中 u1")
+	}
+	got := p.PickExcludingForRealm(nil, "other", "")
+	if got == nil || got.UID != "u1" {
+		t.Fatalf("其他模型应可用，实得 %+v", got)
+	}
+	p.Release("u1")
+	if !p.ServableNow() {
+		t.Error("账号级冷却结束后应可服务")
+	}
 }
