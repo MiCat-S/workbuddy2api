@@ -79,7 +79,7 @@ func (p *Pool) pickScoped(tried map[string]bool, reqModel, realm string, groups 
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLockedScoped(tried, now, realm, groups)
+		return p.pickEarliestExpiryLockedScoped(tried, now, reqModel, realm, groups)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
@@ -243,7 +243,7 @@ func (p *Pool) pickScoped(tried map[string]bool, reqModel, realm string, groups 
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
-	return p.pickEarliestExpiryLockedScoped(tried, now, realm, nil)
+	return p.pickEarliestExpiryLockedScoped(tried, now, "", realm, nil)
 }
 
 // pickEarliestExpiryLockedScoped 是全冷却兜底的完整实现，额外支持业务分组过滤。
@@ -252,7 +252,11 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 // 兜底不滤的话，当**本组账号全部进入冷却**时（正是业务高峰或上游风控期），网关会从
 // 其他组"借号"顶上——隔离恰好在本该最可靠的时候失效，且日志上只是一次正常的
 // fallback_earliest_expiry，看不出串组。故此处与 pickScoped 同口径过滤。
-func (p *Pool) pickEarliestExpiryLockedScoped(tried map[string]bool, now time.Time, realm string, groups []string) *auth.Auth {
+//
+// reqModel 非空时同样跳过对该模型处于独立冷却（6004 限额 / 11102 无此模型）的账号：
+// expiry() 只看账号级截止，不看模型级，不跳过的话兜底会反复挑中「已知该模型用不了」
+// 的号，每次都白打一次上游再吃同一个错误（global 账号对多余上游请求尤其敏感）。
+func (p *Pool) pickEarliestExpiryLockedScoped(tried map[string]bool, now time.Time, reqModel, realm string, groups []string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -266,6 +270,9 @@ func (p *Pool) pickEarliestExpiryLockedScoped(tried map[string]bool, now time.Ti
 		}
 		if e.disabled || e.manualDisabled {
 			continue // 禁用/手动停用的账号永不参与兜底
+		}
+		if e.modelCooled(now, reqModel) {
+			continue // 该模型处于独立冷却：兜底挑它也必然再撞同一个模型级错误
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
