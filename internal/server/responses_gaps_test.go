@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -181,5 +183,41 @@ func TestChatClientCancelNotPenalized(t *testing.T) {
 		if st, _ := p.Status(uid); st.ConsecutiveFails != 0 {
 			t.Errorf("%s 因客户端取消被记连败: %d", uid, st.ConsecutiveFails)
 		}
+	}
+}
+
+// TestResponsesAcceptsChatMessages 客户端（如 Nagram）把 chat 形态的 messages 发到 /v1/responses、
+// 不带 input：原样采用 messages，而不是回 400（下游中转会因此把整个供应商熔断）。
+func TestResponsesAcceptsChatMessages(t *testing.T) {
+	up, bodies := newCapturingUpstream(chatSSE("stop", "", `{"role":"assistant","content":"hi there"}`))
+	rec := postResponses(newResponsesHandler(up), `{"model":"glm-5.2","stream":true,
+	  "messages":[{"role":"system","content":"be nice"},{"role":"user","content":"hello"}]}`)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	evs := parseResponsesSSE(t, rec.Body.String())
+	if last := evs[len(evs)-1]; last.name != "response.completed" {
+		t.Fatalf("终态事件=%s", last.name)
+	}
+	sent := bodies()
+	msgs, _ := sent[0]["messages"].([]any)
+	got := mustJSON(t, msgs[len(msgs)-1])
+	if got != `{"content":"hello","role":"user"}` {
+		t.Errorf("上游末条消息=%s", got)
+	}
+}
+
+// TestResponsesEmptyInputStill400 既没有 input 也没有 messages：仍然 400，并记录诊断日志。
+func TestResponsesEmptyInputStill400(t *testing.T) {
+	up, _ := newCapturingUpstream(chatSSE("stop", ""))
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	rec := postResponses(newResponsesHandler(up), `{"model":"glm-5.2","stream":true,"foo":1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if !strings.Contains(buf.String(), "body keys=foo,model,stream") || !strings.Contains(buf.String(), "input=missing") {
+		t.Errorf("诊断日志缺结构信息: %q", buf.String())
 	}
 }

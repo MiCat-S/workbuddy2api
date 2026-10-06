@@ -26,6 +26,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/logfmt"
 )
 
 // responsesRequest Responses 请求里本层会用到的字段（其余字段如 store / include /
@@ -48,10 +50,13 @@ type responsesRequest struct {
 	Text *struct {
 		Format json.RawMessage `json:"format"`
 	} `json:"text"`
-	PromptCacheKey     string         `json:"prompt_cache_key"`
-	User               string         `json:"user"`
-	PreviousResponseID string         `json:"previous_response_id"`
-	Metadata           map[string]any `json:"metadata"`
+	// Messages 非标准字段：部分客户端（如 Nagram）把 chat 形态的 messages 发到
+	// /v1/responses 而不带 input。没有 input 时按 chat messages 原样采用，见 responsesToChat。
+	Messages           []map[string]any `json:"messages"`
+	PromptCacheKey     string           `json:"prompt_cache_key"`
+	User               string           `json:"user"`
+	PreviousResponseID string           `json:"previous_response_id"`
+	Metadata           map[string]any   `json:"metadata"`
 }
 
 // responsesMeta 一次请求的转换上下文：响应对象的回显字段 + custom 工具名表
@@ -83,6 +88,9 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	chat, meta, err := responsesToChat(&req)
 	if err != nil {
+		// 只记结构不记内容：客户端发来的形态是排查这类 400 的唯一线索（下游中转通常不存请求体）。
+		log.Printf("WARN: [responses] 400 %v; ua=%q body keys=%s input=%s", err,
+			logfmt.Truncate(r.UserAgent(), 60), bodyKeys(raw), jsonKind(req.Input))
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -136,6 +144,13 @@ func responsesToChat(req *responsesRequest) (map[string]any, *responsesMeta, err
 	}
 	if err := b.addInput(req.Input); err != nil {
 		return nil, nil, err
+	}
+	if len(bytes.TrimSpace(req.Input)) == 0 && len(req.Messages) > 0 {
+		// 没有 input、却带了 chat 形态的 messages：本来就是上游要的格式，原样采用，
+		// 而不是回 400——那会让下游中转（claude-code-hub 等）把整个供应商熔断。
+		for _, m := range req.Messages {
+			b.msgs = append(b.msgs, m)
+		}
 	}
 	if len(b.msgs) == 0 {
 		return nil, nil, fmt.Errorf("input is required")
@@ -780,4 +795,39 @@ func responsesNotSupported(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIError(w, http.StatusNotFound, "not_found",
 		"not supported: this gateway does not store responses, so retrieve/cancel/compact/input_tokens endpoints are unavailable")
+}
+
+// bodyKeys 请求体的顶层键（排序后逗号拼接），供 400 诊断日志用。
+func bodyKeys(raw []byte) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return "<not an object>"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+// jsonKind 描述一段 JSON 的形态（缺失 / null / 字符串 / 数组长度 / 对象），不含内容。
+func jsonKind(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return "missing"
+	}
+	switch raw[0] {
+	case 'n':
+		return "null"
+	case '"':
+		return "string"
+	case '{':
+		return "object"
+	case '[':
+		var arr []json.RawMessage
+		_ = json.Unmarshal(raw, &arr)
+		return fmt.Sprintf("array(len=%d)", len(arr))
+	}
+	return "other"
 }
