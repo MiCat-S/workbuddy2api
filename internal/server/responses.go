@@ -181,10 +181,16 @@ func responsesToChat(req *responsesRequest) (map[string]any, *responsesMeta, err
 	}
 	if req.Reasoning != nil && req.Reasoning.Effort != "" {
 		effort := strings.ToLower(strings.TrimSpace(req.Reasoning.Effort))
-		if effort == "none" {
-			effort = "off" // Responses 的 none 对应本网关档位表里的 off（payload.effortRank）
+		switch {
+		case effort == "none" && isDeepSeekBare(req.Model):
+			// DeepSeek 的思考开关是 thinking 字段：只给 effort 时 injectThinking 照样注入
+			// enabled，思考关不掉。显式 disabled 会被尊重，并顺带去掉 effort。
+			chat["thinking"] = map[string]any{"type": "disabled"}
+		case effort == "none":
+			chat["reasoning_effort"] = "off" // Responses 的 none 对应本网关档位表里的 off（payload.effortRank）
+		default:
+			chat["reasoning_effort"] = effort
 		}
-		chat["reasoning_effort"] = effort
 	}
 	if req.Text != nil {
 		if rf := convertResponsesTextFormat(req.Text.Format); rf != nil {
@@ -210,6 +216,39 @@ func responsesToChat(req *responsesRequest) (map[string]any, *responsesMeta, err
 type chatMsgBuilder struct {
 	msgs             []map[string]any
 	pendingReasoning string
+	// pendingToolImages 工具输出里的图片（如 Codex 的 view_image）。chat 的 tool 消息只能放
+	// 文本，且并行调用的多条 tool 消息必须紧跟 assistant——图片暂存，等这一串 tool 消息
+	// 结束后补一条 user 消息带上。
+	pendingToolImages []any
+}
+
+// flushToolImages 把暂存的工具输出图片作为一条 user 消息追加。
+func (b *chatMsgBuilder) flushToolImages() {
+	if len(b.pendingToolImages) == 0 {
+		return
+	}
+	content := append([]any{map[string]any{"type": "text", "text": "Images returned by the tool call(s) above:"}}, b.pendingToolImages...)
+	b.msgs = append(b.msgs, map[string]any{"role": "user", "content": content})
+	b.pendingToolImages = nil
+}
+
+// splitToolOutput 拆分工具输出：文本段拼成字符串，input_image 段转成 chat 的 image_url 分段。
+func splitToolOutput(out any) (string, []any) {
+	arr, ok := out.([]any)
+	if !ok {
+		return textOfParts(out), nil
+	}
+	var imgs []any
+	for _, p := range arr {
+		pm, ok := p.(map[string]any)
+		if !ok || pm["type"] != "input_image" {
+			continue
+		}
+		if url, _ := pm["image_url"].(string); url != "" {
+			imgs = append(imgs, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+		}
+	}
+	return textOfParts(out), imgs
 }
 
 func (b *chatMsgBuilder) messages() []any {
@@ -264,10 +303,14 @@ func (b *chatMsgBuilder) addInput(raw json.RawMessage) error {
 		return fmt.Errorf("input must be a string or an array of items: %w", err)
 	}
 	for i, it := range items {
+		if t, _ := it["type"].(string); t != "function_call_output" && t != "custom_tool_call_output" {
+			b.flushToolImages() // 一串 tool 消息结束：补上其中的图片
+		}
 		if err := b.addItem(it); err != nil {
 			return fmt.Errorf("input[%d]: %w", i, err)
 		}
 	}
+	b.flushToolImages()
 	return nil
 }
 
@@ -316,10 +359,15 @@ func (b *chatMsgBuilder) addItem(it map[string]any) error {
 	case "function_call_output", "custom_tool_call_output":
 		b.pendingReasoning = ""
 		callID, _ := it["call_id"].(string)
+		text, imgs := splitToolOutput(it["output"])
+		if text == "" && len(imgs) > 0 {
+			text = "(image output, attached in the following message)"
+		}
+		b.pendingToolImages = append(b.pendingToolImages, imgs...)
 		b.msgs = append(b.msgs, map[string]any{
 			"role":         "tool",
 			"tool_call_id": callID,
-			"content":      textOfParts(it["output"]),
+			"content":      text,
 		})
 	case "reasoning":
 		if s := reasoningText(it); s != "" {
@@ -506,6 +554,12 @@ func convertResponsesToolChoice(raw json.RawMessage) any {
 	case "function", "custom":
 		if name, _ := o["name"].(string); name != "" {
 			return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+		}
+	case "allowed_tools":
+		// chat 没有「限定子集」的写法，工具表照常全量下发；但 mode=required（必须调用其一）
+		// 的语义要保住，不能降成 auto。
+		if mode, _ := o["mode"].(string); mode == "required" {
+			return "required"
 		}
 	}
 	return "auto"
@@ -830,4 +884,10 @@ func jsonKind(raw json.RawMessage) string {
 		return fmt.Sprintf("array(len=%d)", len(arr))
 	}
 	return "other"
+}
+
+// isDeepSeekBare 去掉 realm 前缀后判断是否 DeepSeek 模型（与 upstream.isDeepSeekModel 同口径）。
+func isDeepSeekBare(model string) bool {
+	_, bare := resolveModel(model)
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(bare)), "deepseek")
 }

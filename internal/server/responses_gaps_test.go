@@ -221,3 +221,66 @@ func TestResponsesEmptyInputStill400(t *testing.T) {
 		t.Errorf("诊断日志缺结构信息: %q", buf.String())
 	}
 }
+
+// TestResponsesToolOutputImages 工具输出里的图片不再被丢弃：tool 消息保留文本，并行调用的
+// tool 消息仍连续紧跟 assistant，图片在这一串之后以 user 消息补上。
+func TestResponsesToolOutputImages(t *testing.T) {
+	var req responsesRequest
+	_ = json.Unmarshal([]byte(`{"model":"m","input":[
+	  {"role":"user","content":"look at both"},
+	  {"type":"function_call","call_id":"c1","name":"view_image","arguments":"{}"},
+	  {"type":"function_call","call_id":"c2","name":"view_image","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"data:image/png;base64,AAA"}]},
+	  {"type":"function_call_output","call_id":"c2","output":[{"type":"input_text","text":"second"},{"type":"input_image","image_url":"data:image/png;base64,BBB"}]},
+	  {"role":"user","content":"thanks"}
+	]}`), &req)
+	chat, _, err := responsesToChat(&req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := chat["messages"].([]any)
+	roles := make([]string, len(msgs))
+	for i, m := range msgs {
+		roles[i] = m.(map[string]any)["role"].(string)
+	}
+	if strings.Join(roles, ",") != "user,assistant,tool,tool,user,user" {
+		t.Fatalf("roles=%v（tool 消息必须连续紧跟 assistant，图片在其后）", roles)
+	}
+	if got := msgs[3].(map[string]any)["content"]; got != "second" {
+		t.Errorf("tool 文本=%v", got)
+	}
+	imgMsg := mustJSON(t, msgs[4])
+	if !strings.Contains(imgMsg, "base64,AAA") || !strings.Contains(imgMsg, "base64,BBB") || !strings.Contains(imgMsg, `"image_url"`) {
+		t.Errorf("图片消息=%s", imgMsg)
+	}
+}
+
+// TestResponsesEffortNoneDisablesDeepSeekThinking DeepSeek 上 effort=none 要真正关掉思考（thinking
+// disabled），而不是只送 effort=off（injectThinking 会照样注入 enabled）。非 DeepSeek 维持 off。
+func TestResponsesEffortNoneDisablesDeepSeekThinking(t *testing.T) {
+	none := &struct {
+		Effort  string `json:"effort"`
+		Summary string `json:"summary"`
+	}{Effort: "none"}
+	chat, _, _ := responsesToChat(&responsesRequest{Model: "global:deepseek-v4.1-flash", Input: json.RawMessage(`"hi"`), Reasoning: none})
+	if mustJSON(t, chat["thinking"]) != `{"type":"disabled"}` {
+		t.Errorf("thinking=%v want disabled", chat["thinking"])
+	}
+	if _, has := chat["reasoning_effort"]; has {
+		t.Errorf("关思考时不应带 reasoning_effort: %v", chat["reasoning_effort"])
+	}
+	chat, _, _ = responsesToChat(&responsesRequest{Model: "glm-5.2", Input: json.RawMessage(`"hi"`), Reasoning: none})
+	if chat["reasoning_effort"] != "off" || chat["thinking"] != nil {
+		t.Errorf("非 DeepSeek: effort=%v thinking=%v", chat["reasoning_effort"], chat["thinking"])
+	}
+}
+
+// TestResponsesAllowedToolsRequired allowed_tools 的 mode=required 不能降成 auto。
+func TestResponsesAllowedToolsRequired(t *testing.T) {
+	if got := convertResponsesToolChoice(json.RawMessage(`{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"f"}]}`)); got != "required" {
+		t.Errorf("mode=required -> %v", got)
+	}
+	if got := convertResponsesToolChoice(json.RawMessage(`{"type":"allowed_tools","mode":"auto","tools":[]}`)); got != "auto" {
+		t.Errorf("mode=auto -> %v", got)
+	}
+}
