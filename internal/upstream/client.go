@@ -1082,6 +1082,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {
 			cancel()
+			if ctx.Err() != nil {
+				// 调用方取消（客户端断开）：不是连接层故障——不清共享连接池（会连带
+				// 打断其他在途请求的连接复用），也不打 ERR 污染日志。
+				return nil, 0, nil, err
+			}
 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固第 5 件）：
 			// 失败连接可能仍留在空闲池里，下一个请求会继续捡到它（kongjianguan

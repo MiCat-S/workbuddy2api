@@ -24,6 +24,13 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// errStreamInterrupted 流已开始后中途读失败（空闲掐流 / 上游 RST / 调用方取消）。
+// StreamHint 已在流里写了一帧 error，调用方据此把这次请求记为失败观测而不是 200。
+var errStreamInterrupted = errors.New("upstream stream interrupted")
+
+// IsStreamInterrupted 报告错误是否为「流中途读失败」（区别于空流与客户端写失败）。
+func IsStreamInterrupted(err error) bool { return errors.Is(err, errStreamInterrupted) }
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -370,16 +377,20 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			if v, ok := tc["index"].(float64); ok {
 				idx = int(v)
 			}
+			fn, _ := tc["function"].(map[string]any)
 			if seen[idx] {
-				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
-				if fn, _ := tc["function"].(map[string]any); fn != nil {
+				// 已发过 name：删除本分片的 name 键（存在即删，幂等）。
+				if fn != nil {
 					delete(fn, "name")
 				}
 				continue
 			}
-			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
-			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
-			seen[idx] = true
+			// 首次带出非空 name 才标记：保留 name 键原样，随后分片统一删除。首片不带
+			// name、后续分片才补的上游形态下，若首片就标记，迟到的 name 会被当成重复
+			// 删掉，客户端永远拿不到工具名。
+			if name, _ := fn["name"].(string); name != "" {
+				seen[idx] = true
+			}
 		}
 	}
 }
@@ -586,7 +597,12 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
-			return err
+			// 中途读失败（空闲掐流 / 上游 RST）：HTTP 头早已发出，只能在流里告知——
+			// 写一帧 error 再结束，否则客户端看到的是正常 EOF，会把半截回答当成完整。
+			// 不补 [DONE]：这不是正常收尾。
+			msg, _ := json.Marshal("upstream stream interrupted: " + err.Error())
+			_ = writeRaw(`{"error":{"message":` + string(msg) + `,"type":"upstream_error","code":"stream_interrupted"}}`)
+			return fmt.Errorf("%w: %v", errStreamInterrupted, err)
 		}
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），

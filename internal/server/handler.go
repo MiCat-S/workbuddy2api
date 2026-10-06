@@ -714,7 +714,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 只落"大请求"（≥4MB 固定阈值，原 max_body_mb/2 语义的接替）：小探针
 	// （{"input":"hi"} 之类）会覆盖掉真正要看的对话请求。
 	if os.Getenv("WB2A_DUMP_REQ") != "" && len(body) >= dumpReqMinBytes {
-		if err := os.WriteFile("/app/data/last_request.json", body, 0o600); err != nil {
+		if err := os.WriteFile("./data/last_request.json", body, 0o600); err != nil {
 			log.Printf("ERR: [server] dump req: %v", err)
 		}
 	}
@@ -960,6 +960,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if errors.As(terr, &uerr) {
 			status = uerr.Status
 		}
+		if uerr == nil && terr != nil && r.Context().Err() != nil {
+			// 客户端已断开（多见于等首字节期间取消）：传输层错误只是取消的回声，不是
+			// 账号或上游的错——不喂连败计数、不换号重试（人已经走了），按 nginx 口径记 499。
+			st.status = statusClientClosedRequest
+			return
+		}
 		if uerr == nil && terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
@@ -1096,6 +1102,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+			} else if upstream.IsStreamInterrupted(sErr) {
+				// 流中途读失败：StreamHint 已在流里写 error 帧。客户端先走（ctx 取消）记 499，
+				// 否则是上游掐流，记 502——两者都不是成功，不能让日志/统计显示 200。
+				if r.Context().Err() != nil {
+					st.status = statusClientClosedRequest
+				} else {
+					st.status = http.StatusBadGateway
+					log.Printf("WARN: [server] stream acct=%s model=%s: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
+				}
 			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
@@ -1364,6 +1379,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// statusClientClosedRequest 客户端在响应完成前断开（nginx 的 499 口径）。只用于日志与
+// 统计，不会真的写给客户端（连接已经没了）。
+const statusClientClosedRequest = 499
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)
